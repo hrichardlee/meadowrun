@@ -513,6 +513,7 @@ async def run_map(
     ports: Union[Iterable[str], str, Iterable[int], int, None] = None,
     wait_for_result: bool = True,
     max_num_task_attempts: int = 1,
+    per_worker_port: Optional[int] = None,
 ) -> Optional[Sequence[_U]]:
     """
     Equivalent to `map(function, args)`, but runs distributed and in parallel.
@@ -615,6 +616,7 @@ async def run_map(
         pickle_protocol,
         wait_option,
         max_num_task_attempts,
+        per_worker_port,
     )
 
 

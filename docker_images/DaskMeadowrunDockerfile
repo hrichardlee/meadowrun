@@ -1,0 +1,3 @@
+FROM meadowrun/meadowrun:0.2.6-py3.9
+
+RUN pip install dask distributed

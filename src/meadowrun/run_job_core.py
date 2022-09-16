@@ -45,7 +45,7 @@ from typing_extensions import Literal
 import meadowrun.ssh as ssh
 from meadowrun.instance_allocation import allocate_jobs_to_instances, InstanceRegistrar
 from meadowrun.instance_selection import ResourcesInternal
-from meadowrun.meadowrun_pb2 import Job, ProcessState, PyFunctionJob
+from meadowrun.meadowrun_pb2 import Job, ProcessState, PyFunctionJob, StringPair
 from meadowrun.shared import unpickle_exception
 
 if TYPE_CHECKING:
@@ -708,6 +708,7 @@ class AllocVM(Host, abc.ABC):
         pickle_protocol: int,
         wait_for_result: WaitOption,
         max_num_task_attempts: int,
+        per_worker_port: Sequence[int],
     ) -> Optional[Sequence[_U]]:
         if resources_required_per_task is None:
             raise ValueError(
@@ -724,6 +725,7 @@ class AllocVM(Host, abc.ABC):
             pickle_protocol,
             wait_for_result,
             max_num_task_attempts,
+            per_worker_port,
         )
 
         if wait_for_result == WaitOption.DO_NOT_WAIT:
@@ -760,6 +762,7 @@ class AllocVM(Host, abc.ABC):
         pickle_protocol: int,
         wait_for_result: WaitOption,
         max_num_task_attempts: int,
+        per_worker_port: Optional[int],
     ) -> AsyncIterable[TaskResult[_U]]:
         if resources_required_per_task is None:
             raise ValueError(
@@ -777,6 +780,7 @@ class AllocVM(Host, abc.ABC):
                     job_fields,
                     resources_required_per_task,
                     wait_for_result,
+                    per_worker_port,
                 )
             )
             num_tasks_done = 0
@@ -919,6 +923,7 @@ class GridJobDriver:
         job_fields: Dict[str, Any],
         resources_required_per_task: ResourcesInternal,
         wait_for_result: WaitOption,
+        per_worker_port: Optional[int],
     ) -> None:
         """
         Allocates cloud instances, runs a worker function on them, sends worker shutdown
@@ -968,7 +973,31 @@ class GridJobDriver:
                 log_file_name: str,
                 inner_instance_registrar: InstanceRegistrar,
             ) -> JobCompletion:
+                nonlocal per_worker_port
                 assert pickled_worker_function_task is not None  # just for mypy
+
+                if per_worker_port is not None:
+                    job_fields_modified = job_fields.copy()
+                    # TODO won't work in all cases I think
+                    if job_fields_modified["ports"]:
+                        job_fields_modified["ports"] = job_fields_modified[
+                            "ports"
+                        ].copy()
+                        job_fields_modified["ports"].append(str(per_worker_port))
+                    else:
+                        job_fields_modified["ports"] = [str(per_worker_port)]
+                    job_fields_modified["environment_variables"] = job_fields_modified[
+                        "environment_variables"
+                    ].copy()
+                    job_fields_modified["environment_variables"].append(
+                        StringPair(
+                            key="MEADOWRUN_PER_WORKER_PORT", value=str(per_worker_port)
+                        )
+                    )
+                    print(f"Using per_worker_port {job_fields_modified['ports']}")
+                    per_worker_port += 1
+                else:
+                    job_fields_modified = job_fields
 
                 job = Job(
                     job_id=inner_worker_job_id,
@@ -979,7 +1008,7 @@ class GridJobDriver:
                             protocol=pickle_protocol,
                         ),
                     ),
-                    **job_fields,
+                    **job_fields_modified,
                 )
 
                 async def deallocator() -> None:
@@ -1013,6 +1042,15 @@ class GridJobDriver:
 
                     # launch new workers if they're needed
                     if new_workers_to_launch > 0:
+                        if per_worker_port is not None:
+                            if job_fields["ports"]:
+                                ports = job_fields["ports"] + [
+                                    f"{per_worker_port}-{per_worker_port + 200}"
+                                ]
+                            else:
+                                ports = [f"{per_worker_port}-{per_worker_port + 200}"]
+                        else:
+                            ports = job_fields["ports"]
                         # TODO pass in an event for if workers_needed goes to 0, cancel
                         # any remaining allocate_jobs_to_instances
                         async for allocated_hosts in allocate_jobs_to_instances(
@@ -1020,7 +1058,7 @@ class GridJobDriver:
                             resources_required_per_task,
                             new_workers_to_launch,
                             alloc_cloud_instance,
-                            job_fields["ports"],
+                            ports,
                             self._abort_launching_new_workers,
                         ):
                             for (
