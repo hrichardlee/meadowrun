@@ -6,6 +6,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import dataclasses
+import datetime
 import enum
 import itertools
 import os
@@ -1117,9 +1118,10 @@ class GridJobDriver:
             # unhelpful to cancel them again, we want them to finish running their
             # except/finally clauses
             async_cancel_exception = True
+            print("We're being cancelled")
             raise
         finally:
-            print("Shutting down workers")
+            print(f"{datetime.datetime.now()} Shutting down workers")
             # setting this is very critical--otherwise, add_tasks_and_get_results will
             # hang forever, not knowing that it has no hope of workers working on any of
             # its tasks
@@ -1251,4 +1253,4 @@ class GridJobDriver:
                 f"Received {num_tasks_done}/{len(args)} task results."
             )
         else:
-            print(f"Received all {len(args)} task results.")
+            print(f"{datetime.datetime.now()} Received all {len(args)} task results.")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import itertools
 import json
 import os
@@ -310,16 +311,27 @@ def worker_function(
     pid = os.getpid()
     log_file_name = f"{public_address}:{log_file_name}"
 
+    started_up = str(datetime.datetime.now())
+    t0 = time.time()
+    t1 = 0
+    t2 = 0
+    t3 = 0
+    count = 0
+
     while True:
+        tt = time.time()
         task = _get_task(
             request_queue_url,
             job_id,
             region_name,
             3,
         )
+        t1 += (time.time() - tt)
         if not task:
             break
 
+
+        tt = time.time()
         task_id, attempt, arg = task
         print(f"Meadowrun agent: About to execute task #{task_id}, attempt #{attempt}")
         try:
@@ -342,12 +354,15 @@ def worker_function(
                 return_code=0,
                 log_file_name=log_file_name,
             )
+        t2 += (time.time() - tt)
+        count += 1
 
         print(
             f"Meadowrun agent: Completed task #{task_id}, attempt #{attempt}, "
             f"state {ProcessState.ProcessStateEnum.Name(process_state.state)}"
         )
 
+        tt = time.time()
         _complete_task(
             job_id,
             region_name,
@@ -355,6 +370,9 @@ def worker_function(
             attempt,
             process_state,
         )
+        t3 += (time.time() - tt)
+
+        print(f"TIMIINGS {t1} {t2} {t3} {time.time() - t0} {count} {started_up}")
 
 
 async def receive_results(
