@@ -98,7 +98,7 @@ def main() -> None:
     to copy into _AMIS.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("type", choices=["plain", "cuda"])
+    parser.add_argument("type", choices=["plain", "cuda", "cuda114"])
     parser.add_argument("regions", type=str)
     parser.add_argument(
         "--on-existing-image", type=str, choices=BEHAVIOR_OPTIONS, default="leave"

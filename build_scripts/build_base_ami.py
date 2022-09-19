@@ -35,6 +35,9 @@ async def plain_base_image_actions_on_vm(
     connection: asyncssh.SSHClientConnection,
 ) -> str:
 
+    print("Update/upgrade")
+    await run_and_print(connection, "sudo apt update && sudo apt upgrade")
+
     # https://docs.docker.com/engine/install/ubuntu/)
     print("install Docker")
     await run_and_print(
@@ -91,8 +94,9 @@ async def plain_base_image_actions_on_vm(
     )
 
 
-async def cuda_base_image_actions_on_vm(
+async def cuda_base_image_actions_helper(
     connection: asyncssh.SSHClientConnection,
+    cuda_nvidia_driver_versions: str,
 ) -> str:
     # https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network
     # combined with
@@ -112,7 +116,7 @@ async def cuda_base_image_actions_on_vm(
         "sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | "  # noqa: E501
         "sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list "
         "&& sudo apt update "
-        "&& sudo apt -y install cuda libcudnn8 libcudnn8-dev nvidia-docker2 "
+        f"&& sudo apt -y install {cuda_nvidia_driver_versions} libcudnn8 libcudnn8-dev nvidia-docker2 "  # noqa: E501
         "&& sudo systemctl restart docker",
     )
 
@@ -140,6 +144,18 @@ async def cuda_base_image_actions_on_vm(
         f"-ubuntu{await parse_ubuntu_version(connection)}"
         f"-python{await parse_python_version(connection, 'python3.9')}"
     )
+
+
+async def cuda_latest_base_image_actions_on_vm(
+    connection: asyncssh.SSHClientConnection,
+) -> str:
+    return await cuda_base_image_actions_helper(connection, "cuda")
+
+
+async def cuda_114_base_image_actions_on_vm(
+    connection: asyncssh.SSHClientConnection,
+) -> str:
+    return await cuda_base_image_actions_helper(connection, "nvidia-driver-470 cuda-drivers=470.141.03-1 cuda-11-4")
 
 
 async def parse_cuda_version(connection: asyncssh.SSHClientConnection) -> str:
@@ -200,7 +216,7 @@ def main() -> None:
     to copy into BASE_AMIS.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("type", choices=["plain", "cuda"])
+    parser.add_argument("type", choices=["plain", "cuda", "cuda114"])
     parser.add_argument("regions", type=str)
     parser.add_argument("--expected-name", type=str)
     parser.add_argument(
@@ -212,7 +228,10 @@ def main() -> None:
         actions_on_vm = plain_base_image_actions_on_vm
         all_region_base_amis = VANILLA_UBUNTU_AMIS
     elif args.type == "cuda":
-        actions_on_vm = cuda_base_image_actions_on_vm
+        actions_on_vm = cuda_latest_base_image_actions_on_vm
+        all_region_base_amis = BASE_AMIS["plain"]
+    elif args.type == "cuda114":
+        actions_on_vm = cuda_114_base_image_actions_on_vm
         all_region_base_amis = BASE_AMIS["plain"]
     else:
         raise ValueError(f"Unexpected type {args.type}")

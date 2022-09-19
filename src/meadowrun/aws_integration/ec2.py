@@ -368,6 +368,7 @@ class LaunchEC2InstanceSettings:
     subnet_id: Optional[str] = None
     security_group_ids: Optional[Sequence[str]] = None
     iam_role_instance_profile: Optional[str] = None
+    ami_substitutions: Dict[str, str] = dataclasses.field(default_factory=lambda: {})
 
 
 async def launch_ec2_instance(
@@ -437,7 +438,7 @@ async def launch_ec2_instance(
         # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Client.run_instances
         success, instances, error_code = await ignore_boto3_error_code_async(
             ec2_client.run_instances(
-                ImageId=launch_settings.ami_id,
+                ImageId=launch_settings.ami_substitutions.get(instance_type, launch_settings.ami_id),
                 MinCount=1,
                 MaxCount=1,
                 InstanceType=instance_type,  # type: ignore
@@ -605,7 +606,7 @@ async def launch_ec2_instances(
     # As we try to launch instances, we will realize that some of them cannot be
     # launched due to lack of capacity in AWS or quotas. We'll keep track of what
     # instance types aren't actually available in this variable
-    unusable_instance_types: Set[Tuple[str, OnDemandOrSpotType]] = set()
+    unusable_instance_types: Set[Tuple[str, OnDemandOrSpotType]] = {("g4dn.xlarge", "spot"), ("g4dn.xlarge", "on_demand"), ("g4dn.2xlarge", "spot"), ("g4dn.2xlarge", "on_demand")}
 
     while num_jobs_left_to_allocate > 0:
         if unusable_instance_types:

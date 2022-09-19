@@ -36,7 +36,10 @@ BASE_AMIS = {
         "eu-west-3": "ami-04653e6ad61b9b8a5",
         "eu-north-1": "ami-0358b4c743a05cdc4",
     },
+    "cuda114": {
+        "us-east-2": "ami-0d6f80424c7a76894",
+    }
 }
 
 
-AMI_SIZES_GB = {"plain": 8, "cuda": 16}
+AMI_SIZES_GB = {"plain": 8, "cuda": 16, "cuda114": 16}

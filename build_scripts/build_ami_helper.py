@@ -233,13 +233,14 @@ async def build_amis(
             if success:
                 print(f'"{region}": "{image_id}",')
     finally:
-        for _, region, _, instance_id in results:
-            if instance_id is not None:
-                # now terminate the instance as we don't need it anymore
-                print(f"Terminating {instance_id} in {region}")
-                boto3.client("ec2", region_name=region).terminate_instances(
-                    InstanceIds=[instance_id]
-                )
+        pass
+        # for _, region, _, instance_id in results:
+        #     if instance_id is not None:
+        #         # now terminate the instance as we don't need it anymore
+        #         print(f"Terminating {instance_id} in {region}")
+        #         boto3.client("ec2", region_name=region).terminate_instances(
+        #             InstanceIds=[instance_id]
+        #         )
 
 
 def _assert_str(s: Any) -> str:

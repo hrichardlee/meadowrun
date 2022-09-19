@@ -5,6 +5,8 @@
 - Copy the region/AMI ID mapping from the output of that script into ami_listing.py under BASE_AMIS["plain"]
 - Build new cuda base AMIs with `build_scripts\build_base_ami.py cuda all`
 - Copy the region/AMI ID mapping from the output of that script into ami_listing.py under BASE_AMIS["cuda"]
+- Build new cuda114 base AMIs with `build_scripts\build_base_ami.py cuda114 all`
+- Copy the region/AMI ID mapping from the output of that script into ami_listing.py under BASE_AMIS["cuda114"]
 
 
 ### To publish meadowrun:

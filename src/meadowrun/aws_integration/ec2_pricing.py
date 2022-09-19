@@ -83,25 +83,14 @@ def _get_ec2_on_demand_prices(region_name: str) -> Iterable[CloudInstanceType]:
     where price is the on-demand price
     """
 
-    try:
-        s3_client = boto3.client("s3", region_name="us-east-2")
-        with io.BytesIO() as buffer:
-            s3_client.download_fileobj("meadowrunprod", "aws_gpu_memory.json", buffer)
-            buffer.seek(0)
-            gpu_memory = json.loads(buffer.getvalue().decode("utf-8"))
-    except Exception as e:
-        logging.warning(
-            "Unable to get most recent GPU memory data, will fall back to data in "
-            f"package: {e}"
-        )
-        with open(
-            pkg_resources.resource_filename(
-                "meadowrun", "aws_integration/aws_gpu_memory.json"
-            ),
-            "r",
-            encoding="utf-8",
-        ) as file:
-            gpu_memory = json.loads(file.read())
+    with open(
+        pkg_resources.resource_filename(
+            "meadowrun", "aws_integration/aws_gpu_details.json"
+        ),
+        "r",
+        encoding="utf-8",
+    ) as file:
+        gpu_details = json.loads(file.read())
 
     # All comments about the pricing API are based on
     # https://www.sentiatechblog.com/using-the-ec2-price-list-api
@@ -267,13 +256,13 @@ def _get_ec2_on_demand_prices(region_name: str) -> Iterable[CloudInstanceType]:
                     non_consumable_resources["nvidia"] = 1.0
 
                 # also, we'll try to assign it GPU memory from our data
-                if instance_type.lower() not in gpu_memory:
+                if instance_type.lower() not in gpu_details:
                     print(
                         f"Warning, skipping {instance_type.lower()} because we don't "
                         "know how much GPU memory it has"
                     )
                 else:
-                    consumable_resources[GPU_MEMORY] = gpu_memory[instance_type.lower()]
+                    consumable_resources[GPU_MEMORY] = gpu_details[instance_type.lower()]["memory"]
 
         avx_version = AvxVersion.NONE
         for feature in attributes.get("processorFeatures", "").split("; "):

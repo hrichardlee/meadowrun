@@ -92,8 +92,6 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 _U = TypeVar("_U")
 
-# AMIs that have meadowrun pre-installed. These are all identical, we just need to
-# replicate into each region.
 _AMIS = {
     "plain": {
         "us-east-2": "ami-00abfaac022e063f2",
@@ -117,6 +115,15 @@ _AMIS = {
         "eu-west-3": "ami-04bc8f1baff8ac55d",
         "eu-north-1": "ami-020a6d5add5ce5c76",
     },
+}
+_CUDA_114_AMIS = {
+    "us-east-2": "ami-12345",
+}
+_CUDA_AMI_SUBSTITUTIONS = {
+    # the p2 instance family has nvidia K80 cards. The last nvidia driver version
+    # compatible with K80 cards is 470, and the last version of cuda compatible with driver version 470 is
+    region: {"p2.xlarge": cuda_114_ami, "p2.8xlarge": cuda_114_ami, "p2.16xlarge": cuda_114_ami}
+    for region, cuda_114_ami in _CUDA_114_AMIS.items()
 }
 SSH_USER = "ubuntu"
 
@@ -452,11 +459,13 @@ class EC2InstanceRegistrar(InstanceRegistrar[_InstanceState]):
 
         region_name = alloc_cloud_instances._get_region_name()
 
+        ami_substitutions = {}
         if alloc_cloud_instances.ami_id:
             ami = alloc_cloud_instances.ami_id
         else:
             if "nvidia" in instance_type_resources_required_per_task.non_consumable:
                 ami_type = "cuda"
+                ami_substitutions = _CUDA_AMI_SUBSTITUTIONS[region_name]
             else:
                 ami_type = "plain"
 
@@ -505,6 +514,7 @@ class EC2InstanceRegistrar(InstanceRegistrar[_InstanceState]):
                 subnet_id=subnet_id,
                 security_group_ids=security_group_ids,
                 iam_role_instance_profile=iam_role_instance_profile,
+                ami_substitutions=ami_substitutions,
             ),
             region_name=region_name,
             # assumes that we've already called ensure_meadowrun_key_pair!
