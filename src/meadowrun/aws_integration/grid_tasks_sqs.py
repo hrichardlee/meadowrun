@@ -7,6 +7,7 @@ import os
 import pickle
 import time
 import traceback
+import datetime
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -21,6 +22,7 @@ from typing import (
 )
 
 import boto3
+import botocore.exceptions
 
 from meadowrun.aws_integration import s3
 from meadowrun.aws_integration.management_lambdas.ec2_alloc_stub import (
@@ -202,6 +204,7 @@ def _get_task(
     job_id: str,
     region_name: str,
     receive_message_wait_seconds: int,
+    ticks,
 ) -> Optional[Tuple[int, int, bytes]]:
     """
     Gets the next task from the specified request_queue, downloads the task argument
@@ -210,7 +213,13 @@ def _get_task(
     Returns a tuple of task_id and pickled argument if there was a task, otherwise
     returns None. Waits receive_message_wait_seconds for a task.
     """
+
+    ttt0 = time.time()
+    tt0 = time.time()
+
     sqs = boto3.client("sqs", region_name=region_name)
+
+    ticks[0] += (time.time() - tt0)
 
     # get the task message
     t0 = time.time()
@@ -222,12 +231,18 @@ def _get_task(
                 " sent a shutdown message or a SIGINT explicitly"
             )
 
+        tt0 = time.time()
+
         result = sqs.receive_message(
             QueueUrl=request_queue_url, WaitTimeSeconds=receive_message_wait_seconds
         )
 
+        ticks[1] += (time.time() - tt0)
+
         if "Messages" in result:
             break
+
+    tt0 = time.time()
 
     messages = result["Messages"]
     if len(messages) != 1:
@@ -235,6 +250,11 @@ def _get_task(
 
     # parse the task request
     task = json.loads(messages[0]["Body"])
+
+    ticks[2] += (time.time() - tt0)
+
+    tt0 = time.time()
+
     if "task_id" in task:
         task_id, attempt, range_from, range_end = (
             task["task_id"],
@@ -253,12 +273,16 @@ def _get_task(
             QueueUrl=request_queue_url, ReceiptHandle=messages[0]["ReceiptHandle"]
         )
 
+        ticks[3] += (time.time() - tt0)
+
         return task_id, attempt, arg
 
     # it's a worker exit message, so return None to exit
     sqs.delete_message(
         QueueUrl=request_queue_url, ReceiptHandle=messages[0]["ReceiptHandle"]
     )
+    ticks[3] += (time.time() - tt0)
+
     return None
 
 
@@ -309,18 +333,33 @@ def worker_function(
     pid = os.getpid()
     log_file_name = f"{public_address}:{log_file_name}"
 
+    print(f"{datetime.datetime.now()} starting working loop")
+
+    t1 = 0
+    t2 = 0
+    t3 = 0
+    count = 0
+    ticks = [0, 0, 0, 0, 0]
+
+    last_task_time = datetime.datetime.now()
+
     while True:
+        t0 = time.time()
         task = _get_task(
             request_queue_url,
             job_id,
             region_name,
             3,
+            ticks
         )
+        t1 += (time.time() - t0)
         if not task:
             break
 
+        t0 = time.time()
+
         task_id, attempt, arg = task
-        print(f"Meadowrun agent: About to execute task #{task_id}, attempt #{attempt}")
+        print(f"{datetime.datetime.now()} Meadowrun agent: About to execute task #{task_id}, attempt #{attempt}")
         try:
             result = function(pickle.loads(arg))
         except Exception as e:
@@ -342,6 +381,9 @@ def worker_function(
                 log_file_name=log_file_name,
             )
 
+        t2 += (time.time() - t0)
+        t0 = time.time()
+
         print(
             f"Meadowrun agent: Completed task #{task_id}, attempt #{attempt}, "
             f"state {ProcessState.ProcessStateEnum.Name(process_state.state)}"
@@ -354,6 +396,17 @@ def worker_function(
             attempt,
             process_state,
         )
+
+        t3 += (time.time() - t0)
+        count += 1
+        last_task_time = datetime.datetime.now()
+
+    print(f"{datetime.datetime.now()} Done with worker loop last task was at {last_task_time}")
+    print(f"Time spent getting tasks {t1}")
+    print(f"Time breakdown {ticks}")
+    print(f"Time spent running tasks {t2}")
+    print(f"Time spent completing tasks {t3}")
+    print(f"Tasks completed {count}")
 
 
 async def receive_results(
@@ -387,7 +440,7 @@ async def receive_results(
 
     results_prefix = _s3_results_prefix(job_id)
     download_keys_received: Set[str] = set()
-    wait = 4  # it's rare for any results to be ready in <4 seconds
+    wait = 2  # it's rare for any results to be ready in <4 seconds
     workers_exited_wait_count = 0
     while not stop_receiving.is_set() and (workers_exited_wait_count < 3 or wait == 0):
 
@@ -413,6 +466,7 @@ async def receive_results(
             if stop_receiving.is_set():
                 break
 
+        print(f"{datetime.datetime.now()} Querying for results waited {wait}")
         keys = await s3.list_objects_async(results_prefix, "", region_name, s3_client)
 
         download_tasks = []
@@ -428,7 +482,7 @@ async def receive_results(
             if wait == 0:
                 wait = 1
             else:
-                wait = min(wait * 2, receive_message_wait_seconds)
+                wait = min(wait + 1, receive_message_wait_seconds)
         else:
             wait = 0
             results = []

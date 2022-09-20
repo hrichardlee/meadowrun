@@ -6,6 +6,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import dataclasses
+import datetime
 import enum
 import itertools
 import os
@@ -16,6 +17,7 @@ import sys
 import time
 import traceback
 import urllib.parse
+import uuid
 import zipfile
 from typing import (
     TYPE_CHECKING,
@@ -494,6 +496,73 @@ class SshHost(Host):
                         f"Error cleaning up files on remote machine: {remote_paths} {e}"
                     )
 
+    async def run_cloud_jobs(
+        self,
+        job: Job,
+        job_ids: List[str],
+        wait_for_result: WaitOption,
+        # TODO something with this!
+        deallocator: Optional[Callable[[], Awaitable[None]]],
+    ) -> JobCompletion[Any]:
+        job_io_prefix = ""
+        deallocation_ran = False
+
+        print(f"{datetime.datetime.now()} run_cloud_jobs start")
+
+        try:
+            connection = await self._connection_future()
+
+            # serialize job_to_run and send it to the remote machine
+            job_io_prefix = f"/var/meadowrun/io/{job.job_id}"
+            await ssh.write_to_file(
+                connection, job.SerializeToString(), f"{job_io_prefix}.job_to_run"
+            )
+
+            command_prefixes = []
+            command_suffixes = []
+
+            if wait_for_result == WaitOption.DO_NOT_WAIT:
+                # reference on nohup: https://github.com/ronf/asyncssh/issues/137
+                command_prefixes.append("/usr/bin/nohup")
+            if self.cloud_provider is not None:
+                command_suffixes.append(
+                    f"--cloud {self.cloud_provider[0]} "
+                    f"--cloud-region-name {self.cloud_provider[1]}"
+                )
+
+            # TODO try to listen to logs? Or throw error on WAIT_AND_TAIL_STDOUT?
+            if wait_for_result == WaitOption.DO_NOT_WAIT:
+                command_suffixes.append("&")
+
+            if command_prefixes:
+                command_prefixes.append(" ")
+            if command_suffixes:
+                command_suffixes.insert(0, " ")
+
+            command = (
+                " ".join(command_prefixes) + "/usr/bin/env PYTHONUNBUFFERED=1 AWS_EC2_METADATA_SERVICE_ENDPOINT=http://127.0.0.1:3131 "
+                "/var/meadowrun/env/bin/python "
+                # "-X importtime "
+                # "-m cProfile -o remote.prof "
+                "-m meadowrun.run_jobs_local_main "
+                f"--job-id {job.job_id} --job-friendly-name {job.job_friendly_name} "
+                "--job-id-overrides " + ",".join(job_ids) + " ".join(command_suffixes)
+            )
+
+            print(f"{datetime.datetime.now()} Running job on {self.address}")
+            print(command)
+
+            # very shortly after this point, we can rely on the deallocation command
+            # running on the remote machine
+            deallocation_ran = True
+            cmd_result = await ssh.run_and_print(connection, command, check=False)
+
+            await asyncio.sleep(99999999)
+
+        finally:
+            # TODO cleanup
+            pass
+
     async def close_connection(self) -> None:
         if self._connect_task is not None:
             connection = await self._connect_task
@@ -901,6 +970,8 @@ class GridJobDriver:
         yet).
         """
 
+        print(f"{datetime.datetime.now()} Starting run_worker_functions")
+
         address_to_ssh_host: Dict[str, SshHost] = {}
         worker_tasks: List[Tuple[str, asyncio.Task[JobCompletion]]] = []
 
@@ -938,14 +1009,15 @@ class GridJobDriver:
             # scope
             async def launch_worker_function(
                 inner_ssh_host: SshHost,
-                inner_worker_job_id: str,
+                inner_worker_job_ids: List[str],
                 log_file_name: str,
                 inner_instance_registrar: InstanceRegistrar,
             ) -> JobCompletion:
                 assert pickled_worker_function_task is not None  # just for mypy
 
                 job = Job(
-                    job_id=inner_worker_job_id,
+                    # TODO use the map job id
+                    job_id=str(uuid.uuid4()),
                     py_function=PyFunctionJob(
                         pickled_function=await pickled_worker_function_task,
                         pickled_function_arguments=pickle.dumps(
@@ -957,16 +1029,11 @@ class GridJobDriver:
                 )
 
                 async def deallocator() -> None:
-                    if inner_ssh_host.instance_name is not None:
-                        await inner_instance_registrar.deallocate_job_from_instance(
-                            await inner_instance_registrar.get_registered_instance(
-                                inner_ssh_host.instance_name
-                            ),
-                            inner_worker_job_id,
-                        )
+                    # TODO
+                    pass
 
-                return await inner_ssh_host.run_cloud_job(
-                    job, wait_for_result, deallocator
+                return await inner_ssh_host.run_cloud_jobs(
+                    job, inner_worker_job_ids, wait_for_result, deallocator
                 )
 
             workers_launched = 0
@@ -1008,26 +1075,23 @@ class GridJobDriver:
                                         public_address, instance_name
                                     )
                                     address_to_ssh_host[public_address] = ssh_host
-                                for worker_job_id in worker_job_ids:
-                                    log_file_name = (
-                                        "/var/meadowrun/job_logs/"
-                                        f"{job_fields['job_friendly_name']}."
-                                        f"{worker_job_id}.log"
+                                log_file_name = (
+                                    "hmmmmm"
+                                )
+                                worker_tasks.append(
+                                    (
+                                        f"{public_address} {log_file_name}",
+                                        asyncio.create_task(
+                                            launch_worker_function(
+                                                ssh_host,
+                                                worker_job_ids,
+                                                log_file_name,
+                                                instance_registrar,
+                                            )
+                                        ),
                                     )
-                                    worker_tasks.append(
-                                        (
-                                            f"{public_address} {log_file_name}",
-                                            asyncio.create_task(
-                                                launch_worker_function(
-                                                    ssh_host,
-                                                    worker_job_id,
-                                                    log_file_name,
-                                                    instance_registrar,
-                                                )
-                                            ),
-                                        )
-                                    )
-                                    workers_launched += 1
+                                )
+                                workers_launched += len(worker_job_ids)
 
                     # shutdown workers if they're no longer needed
                     # once we have the lost worker replacement logic this should just be
@@ -1095,7 +1159,7 @@ class GridJobDriver:
             async_cancel_exception = True
             raise
         finally:
-            print("Shutting down workers")
+            print(f"{datetime.datetime.now()} Shutting down workers")
             # setting this is very critical--otherwise, add_tasks_and_get_results will
             # hang forever, not knowing that it has no hope of workers working on any of
             # its tasks
@@ -1112,9 +1176,9 @@ class GridJobDriver:
             # we still want the tasks to complete their except/finally blocks, after
             # which they should reraise asyncio.CancelledError, which we can safely
             # ignore
-            await asyncio.gather(
-                *(task[1] for task in worker_tasks), return_exceptions=True
-            )
+            # await asyncio.gather(
+            #     *(task[1] for task in worker_tasks), return_exceptions=True
+            # )
 
             await asyncio.gather(
                 *[
@@ -1148,7 +1212,7 @@ class GridJobDriver:
             stop_receiving.set()
         last_printed_update = time.time()
         print(
-            f"Waiting for task results. Requested: {len(args)}, "
+            f"{datetime.datetime.now()} Waiting for task results. Requested: {len(args)}, "
             f"Done: {num_tasks_done}"
         )
         async for batch in await self._cloud_interface.receive_task_results(  # noqa: E501
@@ -1227,4 +1291,4 @@ class GridJobDriver:
                 f"Received {num_tasks_done}/{len(args)} task results."
             )
         else:
-            print(f"Received all {len(args)} task results.")
+            print(f"{datetime.datetime.now()} Received all {len(args)} task results.")

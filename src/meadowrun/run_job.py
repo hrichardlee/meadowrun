@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import os
 import os.path
 import pickle
@@ -552,6 +553,8 @@ async def run_map(
             the return value will always be None.
     """
 
+    print(f"{datetime.datetime.now()} Starting map")
+
     if resources_per_task is None:
         resources_per_task = Resources()
 
@@ -606,7 +609,9 @@ async def run_map(
     else:
         wait_option = WaitOption.WAIT_SILENTLY
 
-    return await host.run_map(
+    print(f"{datetime.datetime.now()} Calling AllocVM.run_map")
+
+    result = await host.run_map(
         function,
         args,
         resources_per_task.to_internal(),
@@ -616,6 +621,10 @@ async def run_map(
         wait_option,
         max_num_task_attempts,
     )
+
+    print(f"{datetime.datetime.now()} Done")
+
+    return result
 
 
 async def run_map_as_completed(

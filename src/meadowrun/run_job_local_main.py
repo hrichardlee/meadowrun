@@ -77,6 +77,8 @@ Some details about point 3:
   That said, it's entirely possible I made some basic mistake.
 
 """
+import datetime
+print(f"{datetime.datetime.now()} about to import")
 
 import argparse
 import asyncio
@@ -90,12 +92,21 @@ import meadowrun.run_job_local
 from meadowrun.meadowrun_pb2 import ProcessState, Job
 from meadowrun.run_job_core import CloudProvider, CloudProviderType
 
+print(f"{datetime.datetime.now()} done with imports")
+
 
 async def main_async(
     job_id: str,
     cloud: Optional[Tuple[CloudProviderType, str]],
+    job_id_override: Optional[str],
 ) -> None:
-    job_io_prefix = f"/var/meadowrun/io/{job_id}"
+    print(f"{datetime.datetime.now()} starting main_async")
+
+    if job_id_override:
+        job_io_prefix = f"/var/meadowrun/io/{job_id_override}"
+    else:
+        job_io_prefix = f"/var/meadowrun/io/{job_id}"
+
     try:
         # write to a temp file and then rename to make sure deallocate_tasks doesn't see
         # a partial write
@@ -103,15 +114,23 @@ async def main_async(
             f.write(str(os.getpid()))
         os.rename(f"{job_io_prefix}.pid_temp", f"{job_io_prefix}.pid")
 
-        with open(f"{job_io_prefix}.job_to_run", mode="rb") as f:
+        with open(f"/var/meadowrun/io/{job_id}.job_to_run", mode="rb") as f:
             bytes_job_to_run = f.read()
         job = Job()
         job.ParseFromString(bytes_job_to_run)
+
+        if job_id_override:
+            job.job_id = job_id_override
+
+        print(f"{datetime.datetime.now()} calling run_local")
+
         first_state, continuation = await meadowrun.run_job_local.run_local(
             job, cloud, True
         )
-        with open(f"{job_io_prefix}.initial_process_state", mode="wb") as f:
-            f.write(first_state.SerializeToString())
+        # with open(f"{job_io_prefix}.initial_process_state", mode="wb") as f:
+        #     f.write(first_state.SerializeToString())
+
+        print(f"{datetime.datetime.now()} waiting for continuation")
 
         if (
             first_state.state != ProcessState.ProcessStateEnum.RUNNING
@@ -151,9 +170,10 @@ async def main_async(
 def main(
     job_id: str,
     cloud: Optional[Tuple[CloudProviderType, str]],
+    job_id_override: Optional[str],
 ) -> None:
     try:
-        asyncio.run(main_async(job_id, cloud))
+        asyncio.run(main_async(job_id, cloud, job_id_override))
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("Job was killed by SIGINT")
 
@@ -165,6 +185,7 @@ def command_line_main() -> None:
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--cloud", choices=CloudProvider)
     parser.add_argument("--cloud-region-name")
+    parser.add_argument("--job-id-override")
     args = parser.parse_args()
 
     if bool(args.cloud is None) ^ bool(args.cloud_region_name is None):
@@ -178,7 +199,7 @@ def command_line_main() -> None:
     else:
         cloud = args.cloud, args.cloud_region_name
 
-    main(args.job_id, cloud)
+    main(args.job_id, cloud, args.job_id_override)
 
 
 if __name__ == "__main__":

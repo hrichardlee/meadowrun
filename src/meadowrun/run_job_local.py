@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import asyncio.subprocess
 import dataclasses
+import datetime
 import itertools
 import os
 import os.path
@@ -564,7 +565,7 @@ async def _launch_container_job(
 
     # finally, run the container
     print(
-        f"Running container ({job_spec_type}): "
+        f"{datetime.datetime.now()} Running container ({job_spec_type}): "
         f"{' '.join(job_spec_transformed.command_line)}; "
         f"container image={container_image_name}; "
         f"PYTHONPATH={job_spec_transformed.environment_variables.get('PYTHONPATH')} "
