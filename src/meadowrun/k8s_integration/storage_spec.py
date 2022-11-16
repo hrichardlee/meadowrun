@@ -17,6 +17,8 @@ from meadowrun.k8s_integration.k8s_core import get_kubernetes_secret
 from meadowrun.storage_grid_job import (
     get_generic_username_password_bucket,
     GenericStorageBucket,
+    get_aws_s3_bucket,
+    S3Bucket,
 )
 
 if TYPE_CHECKING:
@@ -66,10 +68,24 @@ class GenericStorageBucketSpec(StorageBucketSpec):
             return self.endpoint_url_in_cluster
         return self.endpoint_url
 
+    async def get_storage_bucket_in_cluster(self) -> AbstractStorageBucket:
+        return get_generic_username_password_bucket(
+            self.endpoint_url_in_cluster,
+            # TODO this is super incorrect!!!!
+            os.environ.get(MEADOWRUN_STORAGE_USERNAME, None),
+            os.environ.get(MEADOWRUN_STORAGE_PASSWORD, None),
+            self.bucket,
+        )
+
     async def get_storage_bucket(
         self, kubernetes_namespace: str
     ) -> AbstractStorageBucket:
         if self.username_password_secret is not None:
+            # TODO SAME TERRIBLE PROBLEM
+            import kubernetes_asyncio.config as kubernetes_config
+
+            await kubernetes_config.load_kube_config(context="minikube")
+
             secret_data = await get_kubernetes_secret(
                 kubernetes_namespace,
                 self.username_password_secret,
@@ -180,6 +196,53 @@ class GoogleBucketSpec(StorageBucketSpec):
     @classmethod
     async def from_parsed_args(cls, args: argparse.Namespace) -> AbstractStorageBucket:
         return get_google_storage_bucket(args.google_bucket)
+
+
+import aiobotocore.session
+
+
+@dataclasses.dataclass(frozen=True)
+class S3BucketSpec(StorageBucketSpec):
+    region_name: str
+    bucket_name: str
+
+    async def get_storage_bucket(
+        self, kubernetes_namespace: str
+    ) -> AbstractStorageBucket:
+        return S3Bucket(
+            aiobotocore.session.get_session().create_client(
+                "s3", region_name=self.region_name
+            ),
+            self.bucket_name,
+            f"s3/{self.bucket_name}",
+        )
+
+    async def get_storage_bucket_in_cluster(self) -> AbstractStorageBucket:
+        return S3Bucket(
+            aiobotocore.session.get_session().create_client(
+                "s3", region_name=self.region_name
+            ),
+            self.bucket_name,
+            f"s3/{self.bucket_name}",
+        )
+
+    def get_command_line_arguments(self) -> List[str]:
+        return []
+
+    def get_environment_variables(self) -> Iterable[kubernetes_client.V1EnvVar]:
+        return []
+
+    @classmethod
+    def get_storage_type(cls) -> str:
+        raise NotImplementedError()
+
+    @classmethod
+    def add_arguments_to_parser(cls, parser: argparse.ArgumentParser) -> None:
+        raise NotImplementedError()
+
+    @classmethod
+    async def from_parsed_args(cls, args: argparse.Namespace) -> AbstractStorageBucket:
+        raise NotImplementedError()
 
 
 _ALL_STORAGE_BUCKET_SPEC_TYPES: List[Type[StorageBucketSpec]] = [

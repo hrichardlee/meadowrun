@@ -290,6 +290,10 @@ class StorageBucketSpec(abc.ABC):
         ...
 
     @abc.abstractmethod
+    async def get_storage_bucket_in_cluster(self) -> AbstractStorageBucket:
+        ...
+
+    @abc.abstractmethod
     def get_command_line_arguments(self) -> List[str]:
         # Returns command line arguments that can be parsed via add_arguments_to_parser
         # and from_parsed_args to re-create the storage spec in a remote process

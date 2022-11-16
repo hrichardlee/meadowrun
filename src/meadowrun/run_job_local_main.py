@@ -170,7 +170,6 @@ async def main_async(
                     )
                 )
 
-        print(f"Removing {ports_to_remove} adding {ports_to_add}")
         for port in ports_to_remove:
             job.ports.remove(port)
         job.ports.extend(ports_to_add)
