@@ -29,6 +29,8 @@ AMD = "amd"
 AVX = "avx"
 INTEL_DEEP_LEARNING_BOOST = "intel_deep_learning_boost"
 
+MEADOWRUN_PER_WORKER_PORT = "MEADOWRUN_PER_WORKER_PORT"
+
 
 class AvxVersion(enum.IntEnum):
     NONE = 0

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Tuple, Optional
 
+from meadowrun.config import MEADOWRUN_PER_WORKER_PORT
+
 STORAGE_ENV_CACHE_PREFIX = "env_cache/"
 STORAGE_CODE_CACHE_PREFIX = "code_cache/"
 
@@ -82,6 +84,20 @@ def parse_job_id(job_id: str) -> Optional[Tuple[str, int]]:
         return None
 
     return s[0], worker_suffix_int
+
+
+def parse_port_number(port: str) -> Optional[Tuple[int, int]]:
+    port_number_range_str = port[len(MEADOWRUN_PER_WORKER_PORT) + 1 :]
+    s = port_number_range_str.split("-")
+    if len(s) != 2:
+        return None
+    try:
+        range_start = int(s[0])
+        range_end = int(s[1])
+    except ValueError:
+        return None
+
+    return range_start, range_end
 
 
 def job_id_to_storage_key_process_state(job_id: str) -> str:

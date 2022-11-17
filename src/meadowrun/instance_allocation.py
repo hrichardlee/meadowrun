@@ -19,6 +19,7 @@ from typing import (
     TypeVar,
 )
 
+from meadowrun.config import MEADOWRUN_PER_WORKER_PORT
 from meadowrun.instance_selection import (
     CloudInstance,
     ResourcesInternal,
@@ -498,6 +499,19 @@ async def allocate_jobs_to_instances(
 
     Returns {(public_address, name): [job_ids]}
     """
+
+    # modify PER_WORKER_PORTs
+    if ports is not None:
+        ports_to_remove = set()
+        ports_to_add = []
+        for port in ports:
+            if port.startswith(MEADOWRUN_PER_WORKER_PORT):
+                ports_to_remove.add(port)
+                ports_to_add.append(port[len(MEADOWRUN_PER_WORKER_PORT) + 1 :])
+        if ports_to_add or ports_to_add:
+            ports = [
+                port for port in ports if port not in ports_to_remove
+            ] + ports_to_add
 
     authorize_current_ip_task = asyncio.create_task(
         instance_registrar.authorize_current_ip(alloc_cloud_instance)

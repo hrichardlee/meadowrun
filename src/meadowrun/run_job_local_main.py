@@ -92,10 +92,15 @@ from typing import Optional, Tuple, TYPE_CHECKING, Union
 import meadowrun.func_worker_storage_helper
 import meadowrun.run_job_local
 from meadowrun.azure_integration.blob_storage import get_azure_blob_container
-from meadowrun.meadowrun_pb2 import ProcessState, Job
+from meadowrun.config import MEADOWRUN_PER_WORKER_PORT
+from meadowrun.meadowrun_pb2 import ProcessState, Job, StringPair
 from meadowrun.run_job_core import CloudProvider, CloudProviderType, get_log_path
 from meadowrun.storage_grid_job import get_aws_s3_bucket, get_aws_s3_bucket_async
-from meadowrun.storage_keys import job_id_to_storage_key_process_state
+from meadowrun.storage_keys import (
+    job_id_to_storage_key_process_state,
+    parse_job_id,
+    parse_port_number,
+)
 
 if TYPE_CHECKING:
     from meadowrun.deployment_manager import StorageBucketFactoryType
@@ -132,6 +137,47 @@ async def main_async(
             bytes_job_to_run = f.read()
         job = Job()
         job.ParseFromString(bytes_job_to_run)
+
+        # set per-worker port
+        ports_to_remove = []
+        ports_to_add = []
+        for port in job.ports:
+            if port.startswith(MEADOWRUN_PER_WORKER_PORT):
+                ports_to_remove.append(port)
+
+                parsed_job_id = parse_job_id(job_id)
+                if parsed_job_id is None:
+                    print(
+                        "Unable to set MEADOWRUN_PER_WORKER_PORT because job id "
+                        f"{job_id} could not be parsed"
+                    )
+                    continue
+                worker_suffix = parsed_job_id[1]
+
+                port_range = parse_port_number(port)
+                if port_range is None:
+                    print(
+                        f"Unable to set MEADOWRUN_PER_WORKER_PORT because port {port} "
+                        "could not be parsed"
+                    )
+                    continue
+
+                # TODO some sort of warning when we wrap around the end of the range?
+                ports_to_add.append(
+                    str(
+                        port_range[0]
+                        + (worker_suffix % (port_range[1] - port_range[0]))
+                    )
+                )
+
+        print(f"Removing {ports_to_remove} adding {ports_to_add}")
+        for port in ports_to_remove:
+            job.ports.remove(port)
+        job.ports.extend(ports_to_add)
+
+        job.environment_variables.append(
+            StringPair(key=MEADOWRUN_PER_WORKER_PORT, value=",".join(ports_to_add))
+        )
 
         # set storage_bucket, storage_bucket_factory
         if cloud is not None:
