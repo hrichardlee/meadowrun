@@ -468,7 +468,7 @@ async def run_container(
             # AutoRemove turned on, containers can get deleted before we are able to
             # read off their exit codes.
             # "AutoRemove": True,
-            "Memory": 1024 * 1024 * 1024,
+            # "Memory": 1024 * 1024 * 1024,
         },
     }
 

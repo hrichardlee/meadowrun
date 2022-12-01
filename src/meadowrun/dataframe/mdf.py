@@ -22,12 +22,14 @@ from typing import (
     Any,
     Dict,
     Optional,
-    AsyncIterable,
+    AsyncIterable, Coroutine,
 )
 
 import boto3
 
+import meadowrun
 from meadowrun import StorageBucketSpec
+from meadowrun.k8s_integration.storage_spec import S3BucketSpec
 from meadowrun.abstract_storage_bucket import AbstractStorageBucket
 from meadowrun.run_job import run_map
 
@@ -40,6 +42,7 @@ except ImportError:
 
 _T = TypeVar("_T")
 _U = TypeVar("_U")
+_TPartName = TypeVar("_TPartName")
 _TDataFrame = TypeVar("_TDataFrame")
 _UDataFrame = TypeVar("_UDataFrame")
 _VDataFrame = TypeVar("_VDataFrame")
@@ -62,23 +65,23 @@ def _square_bracket_property(func: Callable[[Any, Any], Any]):
 class DataFrame(Generic[_UDataFrame]):
     def __init__(
         self,
-        partition_from_argument: Callable[[int, _TDataFrame], _UDataFrame],
-        arguments: Optional[Sequence[Tuple[int, _TDataFrame]]],
+        part_function: Callable[[int, _TPartName, _TDataFrame], _UDataFrame],
+        part_names_and_values: Optional[Sequence[Tuple[_TPartName, _TDataFrame]]],
         previous_groupby: Optional[DataFrameGroupBy],
     ):
         # if not (bool(arguments) ^ bool(previous_groupby)):
         #     raise ValueError("")
-        self._partition_from_argument = partition_from_argument
-        self._arguments = arguments
+        self._part_function = part_function
+        self._part_names_and_values = part_names_and_values
         self._previous_groupby = previous_groupby
 
     @classmethod
     def from_map(
         cls,
-        partition_from_argument: Callable[[int, _T], _TDataFrame],
-        arguments: Sequence[_T],
+        part_function: Callable[[int, _TPartName, _TDataFrame], _UDataFrame],
+        part_names_and_values: Sequence[Tuple[_TPartName, _TDataFrame]],
     ) -> DataFrame:
-        return cls(partition_from_argument, list(enumerate(arguments)), None)
+        return cls(part_function, part_names_and_values, None)
 
     @classmethod
     async def from_s3(
@@ -93,11 +96,11 @@ class DataFrame(Generic[_UDataFrame]):
             object_names = await sb.list_objects(f"{name}/")
 
         # it seems like sometimes S3 will think that the folder is an object
-        object_names = [name for name in object_names if not name.endswith("/")]
-        object_names.sort()  # should be already sorted
+        object_names = [(object_name[len(name) + 1:], object_name) for object_name in object_names if not object_name.endswith("/")]
+        object_names.sort()  # should be already sorted, but just to be sure
 
         return cls.from_map(
-            lambda i, object_name: asyncio.run(
+            lambda i, part_name, object_name: asyncio.run(
                 _from_s3_helper(storage_bucket, object_name, column_names)
             ),
             object_names,
@@ -105,9 +108,7 @@ class DataFrame(Generic[_UDataFrame]):
 
     @_square_bracket_property
     def parts_loc(self, labels: Any) -> DataFrame[_UDataFrame]:
-        # TODO this doesn't work right now because of the stupid enumerate
-
-        if self._arguments is None:
+        if self._part_names_and_values is None:
             raise NotImplementedError(
                 "Cannot call parts_loc on the result of a groupby"
             )
@@ -121,19 +122,19 @@ class DataFrame(Generic[_UDataFrame]):
             raise NotImplementedError("slices with steps are not supported")
 
         return DataFrame(
-            self._partition_from_argument,
+            self._part_function,
             [
-                argument
-                for argument in self._arguments
-                if (labels.start is None or labels.start <= argument)
-                and (labels.stop is None or labels.stop >= argument)
+                part_name
+                for part_name, part_value in self._part_names_and_values
+                if (labels.start is None or labels.start <= part_name)
+                and (labels.stop is None or labels.stop >= part_name)
             ],
             self._previous_groupby,
         )
 
     @_square_bracket_property
     def parts_iloc(self, labels: Any) -> DataFrame[_UDataFrame]:
-        if self._arguments is None:
+        if self._part_names_and_values is None:
             raise NotImplementedError(
                 "Cannot call parts_iloc on the result of a groupby"
             )
@@ -142,60 +143,57 @@ class DataFrame(Generic[_UDataFrame]):
         # as mddf.parts_between().map_parts(func_with_side_effects)
 
         if isinstance(labels, slice):
-            new_arguments = self._arguments[labels]
+            new_parts = self._part_names_and_values[labels]
         else:
-            new_arguments = [self._arguments[labels]]
+            new_parts = [self._part_names_and_values[labels]]
 
-        return DataFrame(
-            self._partition_from_argument,
-            new_arguments,
-            self._previous_groupby,
-        )
+        return DataFrame(self._part_function, new_parts, self._previous_groupby)
 
     @property
     def part_names(self) -> List[_T]:
-        if self._arguments is None:
+        if self._part_names_and_values is None:
             raise NotImplementedError(
                 "Cannot call part_names on the result of a groupby"
             )
         # TODO I think we should rename _arguments to part_name everywhere
-        return [arg for i, arg in self._arguments]
+        return [part_name for part_name, part_value in self._part_names_and_values]
 
-    def map_parts_with_index(
-        self, func: Callable[[int, _UDataFrame], _VDataFrame]
+    def map_parts_with_name(
+        self, func: Callable[[int, _TPartName, _UDataFrame], _VDataFrame]
     ) -> DataFrame[_VDataFrame]:
         return DataFrame(
-            lambda i, arg: func(i, self._partition_from_argument(i, arg)),
-            self._arguments,
+            lambda i, part_name, part_value: func(i, part_name, self._part_function(i, part_name, part_value)),
+            self._part_names_and_values,
             self._previous_groupby,
         )
 
     def map_parts(
         self, func: Callable[[_UDataFrame], _VDataFrame]
     ) -> DataFrame[_VDataFrame]:
-        return self.map_parts_with_index(lambda i, arg: func(arg))
+        return self.map_parts_with_name(lambda i, part_name, part_value: func(part_value))
 
-    async def compute_with_index(
-        self, *run_map_args, **run_map_kwargs
-    ) -> Sequence[Tuple[int, _PandasDF]]:
-        arguments_list = list(self._arguments)
-        # TODO make this work with _previous_groupby
-        return [
-            (arg, part)
-            for ((i, arg), part) in zip(
-                arguments_list,
-                await run_map(
-                    lambda arg: self._partition_from_argument(*arg),
-                    arguments_list,
-                    *run_map_args,
-                    **run_map_kwargs,
-                ),
-            )
-        ]
+    # BUSTED
+    # async def compute_with_index(
+    #     self, *run_map_args, **run_map_kwargs
+    # ) -> Sequence[Tuple[int, _PandasDF]]:
+    #     arguments_list = list(self._part_names_and_values)
+    #     # TODO make this work with _previous_groupby
+    #     return [
+    #         (arg, part)
+    #         for ((i, arg), part) in zip(
+    #             arguments_list,
+    #             await run_map(
+    #                 lambda arg: self._part_function(*arg),
+    #                 arguments_list,
+    #                 *run_map_args,
+    #                 **run_map_kwargs,
+    #             ),
+    #         )
+    #     ]
 
-    async def compute(self, *run_map_args, **run_map_kwargs) -> Sequence[_TDataFrame]:
-        if self._arguments is not None:
-            arguments = list(self._arguments)
+    async def compute(self, *run_map_args, **run_map_kwargs) -> Sequence[_UDataFrame]:
+        if self._part_names_and_values is not None:
+            part_names_and_values = self._part_names_and_values
         elif self._previous_groupby is not None:
             # TODO we should actually be able to read this off of the Host. And what if it's in run_map_args?
             storage_bucket = run_map_kwargs.pop("storage_bucket")
@@ -209,22 +207,26 @@ class DataFrame(Generic[_UDataFrame]):
                 *run_map_args,
                 **run_map_kwargs,
             )
-            arguments = list(
+            part_names_and_values = (
                 (group_index, (group, storage_bucket))
                 for group_index, group in groups.items()
             )
         else:
             raise ValueError(
-                "Both _arguments and _previous_groupby are None which should never "
+                "Both _part_names and _previous_groupby are None which should never "
                 "happen!"
             )
 
         return await run_map(
-            lambda arg: self._partition_from_argument(*arg),
-            arguments,
+            lambda args: self._part_function(*args),
+            [(i, part_name, part_value) for i, (part_name, part_value) in enumerate(part_names_and_values)],
             *run_map_args,
             **run_map_kwargs,
         )
+
+    async def head(self, *run_map_args, **run_map_kwargs) -> _UDataFrame:
+        # TODO there should be special interaction with .from_s3().head()
+        return (await self.parts_iloc[:1].map_parts(lambda df: df.head()).compute(*run_map_args, **run_map_kwargs))[0]
 
     async def to_pd(self, *run_map_args, **run_map_kwargs) -> _PandasDF:
         return pd.concat(await self.compute(*run_map_args, **run_map_kwargs))
@@ -237,10 +239,14 @@ class DataFrame(Generic[_UDataFrame]):
         *run_map_args,
         **run_map_kwargs,
     ):
-        await self.map_parts_with_index(
-            lambda i, part: asyncio.run(_to_s3_helper(storage_bucket, part, name, i))
+        # TODO use {i} if {part_name} won't work? Or make it an option?
+        await self.map_parts_with_name(
+            lambda i, part_name, part_value: asyncio.run(_to_s3_helper(storage_bucket, part_value, f"{name}/{part_name}.parquet"))
         ).compute(*run_map_args, **run_map_kwargs)
 
+    # TODO this API should be replaced by a plain .flatten() which writes to an
+    # intermediate storage location if there is a subsequent .map_parts OR just writes
+    # directly to a result storage bucket in the case of .flatten().to_s3()
     async def flatten_to_s3(
             self,
             name: str,
@@ -248,7 +254,9 @@ class DataFrame(Generic[_UDataFrame]):
             *run_map_args,
             **run_map_kwargs,
     ):
-        pass
+        await self.map_parts(
+            lambda part_value: asyncio.run(_flatten_to_s3_helper(storage_bucket, part_value, name))
+        ).compute(*run_map_args, **run_map_kwargs)
 
     async def _to_groups(
         self,
@@ -264,15 +272,15 @@ class DataFrame(Generic[_UDataFrame]):
         # different sub jobs
         # TODO add something to storage_keys
         job_id = str(uuid.uuid4())
-        groups_by_source = await self.map_parts_with_index(
-            lambda i, part: (
+        groups_by_source = await self.map_parts_with_name(
+            lambda i, part_name, part_value: (
                 i,
                 asyncio.run(
                     _to_groups_helper(
-                        part,
+                        part_value,
                         column_names,
                         num_bits,
-                        f"{job_id}/{i}.pkl",
+                        f"TO_RENAME_INTERMEDIATES/{job_id}/{i}.pkl",
                         storage_bucket,
                     )
                 ),
@@ -286,7 +294,7 @@ class DataFrame(Generic[_UDataFrame]):
                     groups_by_dest[dest_index] = []
 
                 groups_by_dest[dest_index].append(
-                    (f"{job_id}/{source_index}.pkl", byte_range)
+                    (f"TO_RENAME_INTERMEDIATES/{job_id}/{source_index}.pkl", byte_range)
                 )
 
         return groups_by_dest
@@ -336,13 +344,24 @@ async def _from_s3_helper(
 
 
 async def _to_s3_helper(
-    storage_bucket: StorageBucketSpec, part: Any, name: str, i: int
-):
+    storage_bucket: StorageBucketSpec, part_value: _PandasDF, result_key: str,
+) -> None:
     async with await storage_bucket.get_storage_bucket_in_cluster() as sb:
-        await sb.write_bytes(part.to_parquet(), f"{name}/{i}.parquet")
+        await sb.write_bytes(part_value.to_parquet(**{
+            'coerce_timestamps': 'us',
+            'allow_truncated_timestamps': True,
+        }), result_key)
 
     # async def to_pd(self, *run_map_args, **run_map_kwargs) -> _PandasDF:
     #     return pd.concat(await self.)
+
+
+async def _flatten_to_s3_helper(
+    storage_bucket: StorageBucketSpec, part_value: Iterable[Tuple[str, _PandasDF]], result_key_prefix: str,
+) -> None:
+    async with await storage_bucket.get_storage_bucket_in_cluster() as sb:
+        for sub_part_name, sub_part_value in part_value:
+            await sb.write_bytes(sub_part_value.to_parquet(), f"{result_key_prefix}/{sub_part_name}")
 
 
 _TO_BE_NAMED_MAPPING = {
@@ -390,6 +409,10 @@ async def _to_groups_helper(
     hash_column = pd.Series(
         np.repeat(np.array([2870177450012600261], dtype="uint64"), len(df))
     )
+
+    # TODO document that indexes will get dropped
+    df = df.reset_index(drop=True)
+
     for column_name in column_names:
         hash_column ^= _as_uint64(df.loc[:, column_name])
 
@@ -463,7 +486,7 @@ class DataFrameGroupBy(Generic[_TDataFrame]):
             )
 
         return DataFrame(
-            lambda i, arg: reducer_func(asyncio.run(_read_groups(arg[0], arg[1]))),
+            lambda i, part_name, part_value: reducer_func(asyncio.run(_read_groups(part_value[0], part_value[1]))),
             None,
             previous_groupby,
         )
@@ -494,7 +517,7 @@ def sample_df(num_rows: int):
     )
 
 
-async def test():
+async def test_adhoc():
     import meadowrun
 
     # storage_bucket = meadowrun.GenericStorageBucketSpec("meadowrunbucket",
@@ -506,7 +529,6 @@ async def test():
     #     kube_config_context="minikube",
     # )
 
-    from meadowrun.k8s_integration.storage_spec import S3BucketSpec
 
     storage_bucket = S3BucketSpec("us-east-2", "meadowrun-us-east-2-034389035875")
     host = meadowrun.AllocEC2Instance()
@@ -528,7 +550,7 @@ async def test():
     )
 
     # mddf = DataFrame.from_map(lambda i, arg: sample_df(500), range(5))
-    # print(await mddf.map_parts_with_index(lambda i, df: df.sum()).compute(**the_args))
+    # print(await mddf.map_parts_with_name(lambda i, df: df.sum()).compute(**the_args))
     # print(await mddf.to_s3("test_mdf", storage_bucket, **the_args))
 
     def foo(i, df):
@@ -541,7 +563,7 @@ async def test():
 
     mddf = await DataFrame.from_s3("yellow_taxi", storage_bucket)
 
-    # print((await mddf.map_parts_with_index(foo).map_parts_with_index(foo).compute(**the_args))[0])
+    # print((await mddf.map_parts_with_name(foo).map_parts_with_name(foo).compute(**the_args))[0])
     # print((await mddf.map_parts(foo2).map_parts(foo2).compute(**the_args))[0])
 
     #
@@ -559,7 +581,7 @@ async def test():
     # print(await mddf.to_pd(**the_args))
 
 
-async def test2(n):
+async def test_benchmark1(n):
     import meadowrun
     from meadowrun.k8s_integration.storage_spec import S3BucketSpec
 
@@ -614,13 +636,199 @@ async def test2(n):
     print(time.time() - t0)
 
 
+async def test_generate_data2():
+    import meadowrun
+    from meadowrun.k8s_integration.storage_spec import S3BucketSpec
+
+    storage_bucket = S3BucketSpec("us-east-2", "meadowrun-us-east-2-034389035875")
+    host = meadowrun.AllocEC2Instance()
+    resources = meadowrun.Resources(1, 3)
+    deployment = await meadowrun.Deployment.mirror_local(
+        interpreter=meadowrun.LocalPipInterpreter(sys.executable)
+    )
+
+    the_args = dict(
+        num_concurrent_tasks=16,
+        host=host,
+        deployment=deployment,
+        resources_per_task=resources,
+    )
+
+    mddf = await DataFrame.from_s3(
+        "yellow_taxi",
+        storage_bucket,
+        # column_names=["PULocationID", "DOLocationID", "tip_amount", "total_amount"]
+    )
+
+
+    # mddf = mddf.parts_iloc[-1:]
+
+    print(len(mddf.part_names))
+
+    def foo(x):
+        x["date"] = pd.to_datetime(x["tpep_pickup_datetime"].dt.date)
+        return [(str(date.date()), gr) for date, gr in x.groupby("date")]
+
+    t0 = time.time()
+
+    # print(await mddf.map_parts(foo).compute(**the_args))
+    result = await mddf.map_parts(foo).flatten_to_s3("yellow_taxi_by_day", storage_bucket=storage_bucket, **the_args)
+    print(result)
+
+    print(time.time() - t0)
+    return result
+
+
+async def test_benchmark2(n):
+    import meadowrun
+    from meadowrun.k8s_integration.storage_spec import S3BucketSpec
+
+    storage_bucket = S3BucketSpec("us-east-2", "meadowrun-us-east-2-034389035875")
+    host = meadowrun.AllocEC2Instance()
+    resources = meadowrun.Resources(1, 2)
+    deployment = await meadowrun.Deployment.mirror_local(
+        interpreter=meadowrun.LocalPipInterpreter(sys.executable)
+    )
+
+    the_args = dict(
+        num_concurrent_tasks=128,
+        host=host,
+        deployment=deployment,
+        resources_per_task=resources,
+        # retry_with_more_memory=True,
+        # max_num_task_attempts=2,
+    )
+
+    mddf = await DataFrame.from_s3(
+        "yellow_taxi_by_day",
+        storage_bucket,
+        # column_names=["PULocationID", "DOLocationID", "tip_amount", "total_amount"]
+    )
+
+
+    mddf = mddf.parts_iloc[-n:]
+
+    print(len(mddf.part_names))
+
+    # print(await mddf.map_parts(lambda df: df.head()).compute(**the_args))
+    #
+    # print(mddf.part_names)
+    #
+    # print(await mddf.map_parts(
+    #     lambda df: (
+    #         len(pickle.dumps(df)),
+    #         len(pickle.dumps(df.assign(trip_distance_rounded=(df["trip_distance"] * 10).round().astype(int)).groupby(["PULocationID", "DOLocationID", "trip_distance_rounded"]).sum())),
+    #         len(pickle.dumps(df.groupby(["PULocationID", "DOLocationID"]).sum())),
+    #         len(pickle.dumps(df.groupby(["PULocationID", "DOLocationID", "passenger_count"]).sum())),
+    #     )
+    # ).compute(**the_args))
+
+    t0 = time.time()
+
+    print(
+        await mddf.groupby(["PULocationID", "DOLocationID"], 1)
+        .apply(lambda df: df.sum())
+        .to_pd(storage_bucket=storage_bucket, **the_args)
+    )
+
+    print(time.time() - t0)
+
+
+async def fake_checkins():
+    storage_bucket = S3BucketSpec("us-east-2", "meadowrun-us-east-2-034389035875")
+    host = meadowrun.AllocEC2Instance()
+    resources = meadowrun.Resources(1, 3)
+
+    deployment = meadowrun.Deployment.mirror_local(
+        # interpreter=meadowrun.PreinstalledInterpreter(MEADOWRUN_INTERPRETER)
+        # interpreter=meadowrun.PipRequirementsFile(
+        #     r"C:\source\scratch\directories\req-pd.txt", "3.9"
+        # )
+        interpreter=meadowrun.LocalPipInterpreter(sys.executable)
+    )
+
+    the_args = dict(
+        host=host,
+        deployment=deployment,
+        num_concurrent_tasks=70,
+        resources_per_task=resources,
+    )
+
+    # this data
+
+    num_all_users = 300_000_000
+    num_all_locations = 8_000_000
+    all_states = ["AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"]
+
+    # date_arg = pd.Timestamp("2022-01-01")
+
+    def foo(i, date, date_arg):
+        num_rows = np.random.randint(10_000_000, 17_500_000)
+        dts = (date_arg + pd.Series(np.random.random(num_rows) * 60 * 24).round(3) * pd.Timedelta(seconds=1)).sort_values()
+        user_ids = np.random.randint(0, num_all_users, num_rows)
+        location_ids = np.random.randint(0, num_all_locations, num_rows)
+        states = np.random.choice(all_states, num_rows)
+
+        return pd.DataFrame.from_dict({
+            "dt": dts,
+            "user_id": user_ids,
+            "location_id": location_ids,
+            "states": states,
+        }).reset_index(drop=True)
+
+    await DataFrame.from_map(
+        foo, [(str(d.date()), d) for d in pd.date_range("2021-01-01", "2022-12-31")]
+    ).to_s3("fake_checkins", storage_bucket, **the_args)
+
+
+async def test():
+    storage_bucket = S3BucketSpec("us-east-2", "meadowrun-us-east-2-034389035875")
+    host = meadowrun.AllocEC2Instance()
+    resources = meadowrun.Resources(1, 6)
+
+    deployment = await meadowrun.Deployment.mirror_local(
+        interpreter=meadowrun.LocalPipInterpreter(sys.executable),
+        environment_variables={"PYTHONHASHSEED": "0"}
+    )
+
+    the_args = dict(
+        host=host,
+        deployment=deployment,
+        num_concurrent_tasks=8,
+        resources_per_task=resources,
+    )
+
+    mddf = await DataFrame.from_s3(
+        "fake_checkins",
+        storage_bucket)
+    #
+    # def foo(df):
+    #     result = (len(df), len(pickle.dumps(df)), len(pickle.dumps(df.groupby("states").count())))
+    #     import resource
+    #     return result, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+    # print(await mddf.map_parts(foo).parts_iloc[:64].compute(**the_args))
+
+    mddf = mddf.parts_iloc[-64:]
+
+    t0 = time.time()
+
+    def foo(df):
+        stuff = df.groupby("user_id", as_index=False)["location_id"].nunique()
+        user_ids = stuff.loc[stuff["location_id"] > 10, "user_id"]
+        return df[df["user_id"].isin(user_ids)]
+
+    result = await mddf \
+        .groupby(["user_id"], 64) \
+        .map_parts(lambda df: df, foo).compute(storage_bucket=storage_bucket, **the_args)
+
+    print(time.time() - t0)
+
+    result_df = pd.concat(result).sort_values(["user_id", "location_id"])
+    print(result_df)
+    pd.to_pickle(result_df, "temp.pkl")
+
+
+
 if __name__ == "__main__":
-    asyncio.run(test2(999))
-    asyncio.run(test2(999))
-    asyncio.run(test2(112))
-    asyncio.run(test2(96))
-    asyncio.run(test2(80))
-    asyncio.run(test2(64))
-    asyncio.run(test2(48))
-    asyncio.run(test2(32))
-    asyncio.run(test2(16))
+    asyncio.run(test())
