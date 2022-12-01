@@ -666,6 +666,7 @@ async def launch_ec2_instances(
                 if tags is None:
                     tags = {}
                 if "Name" not in tags:
+                    tags = tags.copy()
                     tags["Name"] = f"mdr-{b62_encoded_uuid()}"
                 launch_ec2_result = await launch_ec2_instance(
                     region_name,
