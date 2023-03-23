@@ -216,6 +216,7 @@ async def _worker_iteration(
         f"Meadowrun agent: About to execute task #{task.task_id}, attempt "
         f"#{task.attempt}"
     )
+    t0 = time.time()
 
     try:
         worker_monitor.start_stats()
@@ -257,7 +258,7 @@ async def _worker_iteration(
     print(
         f"Meadowrun agent: Completed task #{task.task_id}, attempt #{task.attempt}, "
         f"state {ProcessState.ProcessStateEnum.Name(process_state.state)}, max "
-        f"memory {process_state.max_memory_used_gb}GB "
+        f"memory {process_state.max_memory_used_gb}GB {time.time() - t0}seconds"
     )
     await _complete_task(result_queue, task, process_state)
 

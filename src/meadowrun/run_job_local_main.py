@@ -184,6 +184,7 @@ async def main_async(
                 if results_to_storage:
                     # we need the storage bucket to upload our results
                     storage_bucket = await get_aws_s3_bucket(cloud[1]).__aenter__()
+                    meadowrun.func_worker_storage_helper.FUNC_WORKER_STORAGE_BUCKET = storage_bucket
                     # storage_bucket_factory can be either a real storage bucket or a
                     # function that returns a storage bucket
                     storage_bucket_factory = storage_bucket

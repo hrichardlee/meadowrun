@@ -25,7 +25,7 @@ async def _configure_meadowrun_ec2(
 ) -> str:
     # TODO move into the base image!
     await run_and_print(connection, "sudo apt remove -y unattended-upgrades")
-    await run_and_print(connection, "sudo apt update && sudo apt install -y nginx nscd")
+    await run_and_print(connection, "sudo apt update && sudo apt install -y nginx")
     await run_and_print(connection, "sudo rm -rf /var/cache/apt")
 
     image_name = await upload_and_configure_meadowrun(connection, **kwargs)

@@ -234,6 +234,9 @@ async def _get_task(
     return None
 
 
+import datetime
+
+
 async def _worker_iteration(
     sqs: SQSClient,
     s3_bucket: S3Bucket,
@@ -259,7 +262,8 @@ async def _worker_iteration(
     worker_restart_needed = False
 
     task_id, attempt, arg = task
-    print(f"Meadowrun agent: About to execute task #{task_id}, attempt #{attempt}")
+    print(f"Meadowrun agent: About to execute task #{task_id}, attempt #{attempt} at {datetime.datetime.now()}")
+    t0 = time.time()
     try:
         worker_monitor.start_stats()
         await worker_server.send_message(arg)
@@ -299,7 +303,7 @@ async def _worker_iteration(
     print(
         f"Meadowrun agent: Completed task #{task_id}, attempt #{attempt}, "
         f"state {ProcessState.ProcessStateEnum.Name(process_state.state)}, max "
-        f"memory {process_state.max_memory_used_gb}GB "
+        f"memory {process_state.max_memory_used_gb}GB {time.time() - t0}seconds at {datetime.datetime.now()}"
     )
     await complete_task(s3_bucket, base_job_id, task_id, attempt, process_state)
 

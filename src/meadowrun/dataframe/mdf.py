@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import dataclasses
 import gzip
 import io
@@ -22,7 +23,7 @@ from typing import (
     Any,
     Dict,
     Optional,
-    AsyncIterable, Coroutine,
+    AsyncIterable, Coroutine, Deque,
 )
 
 import boto3
@@ -32,6 +33,8 @@ from meadowrun import StorageBucketSpec
 from meadowrun.k8s_integration.storage_spec import S3BucketSpec
 from meadowrun.abstract_storage_bucket import AbstractStorageBucket
 from meadowrun.run_job import run_map
+from meadowrun.shared import _chunker
+from meadowrun.storage_grid_job import get_aws_s3_bucket
 
 try:
     import pandas as pd
@@ -68,12 +71,14 @@ class DataFrame(Generic[_UDataFrame]):
         part_function: Callable[[int, _TPartName, _TDataFrame], _UDataFrame],
         part_names_and_values: Optional[Sequence[Tuple[_TPartName, _TDataFrame]]],
         previous_groupby: Optional[DataFrameGroupBy],
+        previous_reduce: Optional[DataFrameReduce],
     ):
-        # if not (bool(arguments) ^ bool(previous_groupby)):
+        # if not (bool(arguments) ^ bool(previous_groupby) ^ bool(previous_reduce)):
         #     raise ValueError("")
         self._part_function = part_function
         self._part_names_and_values = part_names_and_values
         self._previous_groupby = previous_groupby
+        self._previous_reduce = previous_reduce
 
     @classmethod
     def from_map(
@@ -81,7 +86,7 @@ class DataFrame(Generic[_UDataFrame]):
         part_function: Callable[[int, _TPartName, _TDataFrame], _UDataFrame],
         part_names_and_values: Sequence[Tuple[_TPartName, _TDataFrame]],
     ) -> DataFrame:
-        return cls(part_function, part_names_and_values, None)
+        return cls(part_function, part_names_and_values, None, None)
 
     @classmethod
     async def from_s3(
@@ -147,7 +152,7 @@ class DataFrame(Generic[_UDataFrame]):
         else:
             new_parts = [self._part_names_and_values[labels]]
 
-        return DataFrame(self._part_function, new_parts, self._previous_groupby)
+        return DataFrame(self._part_function, new_parts, self._previous_groupby, self._previous_reduce)
 
     @property
     def part_names(self) -> List[_T]:
@@ -165,6 +170,7 @@ class DataFrame(Generic[_UDataFrame]):
             lambda i, part_name, part_value: func(i, part_name, self._part_function(i, part_name, part_value)),
             self._part_names_and_values,
             self._previous_groupby,
+            self._previous_reduce,
         )
 
     def map_parts(
@@ -195,6 +201,7 @@ class DataFrame(Generic[_UDataFrame]):
         if self._part_names_and_values is not None:
             part_names_and_values = self._part_names_and_values
         elif self._previous_groupby is not None:
+            t0 = time.time()
             # TODO we should actually be able to read this off of the Host. And what if it's in run_map_args?
             storage_bucket = run_map_kwargs.pop("storage_bucket")
             # TODO probably just get rid of run_map_args. Also, make this work more generally
@@ -211,10 +218,47 @@ class DataFrame(Generic[_UDataFrame]):
                 (group_index, (group, storage_bucket))
                 for group_index, group in groups.items()
             )
+            print(f"Completed previous groupby in {time.time() - t0}")
+        elif self._previous_reduce is not None:
+            # TODO this should be the same as in _reduce_helper and others
+            weird_job_id = str(uuid.uuid4())
+
+            # TODO see comment above
+            storage_bucket = run_map_kwargs.pop("storage_bucket")
+            if asyncio.iscoroutine(run_map_kwargs.get("deployment", None)):
+                run_map_kwargs["deployment"] = await run_map_kwargs["deployment"]
+
+            t0 = time.time()
+            chunked_intermediates = await self._previous_reduce._base_df._reduce_helper(
+                storage_bucket, self._previous_reduce._branch_factor, *run_map_args, **run_map_kwargs
+            )
+            print(f"Completed stage 0 ({len(self._previous_reduce._base_df._part_names_and_values)} > {len(chunked_intermediates)}) in {time.time() - t0} {datetime.datetime.now()}")
+            stage = 1  # TODO previous line is stage 0
+            while len(chunked_intermediates) > self._previous_reduce._final_num_partitions:
+                t0 = time.time()
+                reducer_func = self._part_function  # TODO there's probably a better way to pass this around?
+                await run_map(
+                    lambda args: _to_intermediate(
+                        reducer_func(args[0], args[0], (args[1], storage_bucket)),
+                        f"TO_RENAME_INTERMEDIATES/{weird_job_id}/{stage}_{args[0]}.pkl",
+                        storage_bucket,
+                    ),
+                    list(enumerate(chunked_intermediates)),
+                    *run_map_args,
+                    **run_map_kwargs
+                )
+
+                chunked_intermediates = list(_chunker(
+                    (f"TO_RENAME_INTERMEDIATES/{weird_job_id}/{stage}_{i}.pkl" for i in
+                     range(len(chunked_intermediates))), self._previous_reduce._branch_factor))
+                print(
+                    f"Completed stage {stage} ({len(chunked_intermediates)}) in {time.time() - t0} {datetime.datetime.now()}")
+
+            part_names_and_values = [(i, (chunk, storage_bucket)) for i, chunk in enumerate(chunked_intermediates)]
         else:
             raise ValueError(
-                "Both _part_names and _previous_groupby are None which should never "
-                "happen!"
+                "_part_names, _previous_groupby, and _previous_reduce are all None "
+                "which should never happen!"
             )
 
         return await run_map(
@@ -299,6 +343,26 @@ class DataFrame(Generic[_UDataFrame]):
 
         return groups_by_dest
 
+    # TODO rename
+    async def _reduce_helper(self, storage_bucket: StorageBucketSpec,
+                             branch_factor: int,
+        *run_map_args,
+        **run_map_kwargs) -> List[Sequence[str]]:
+
+        # TODO see comment above
+        job_id = str(uuid.uuid4())
+        await self.map_parts_with_name(
+            lambda i, part_name, part_value:
+                _to_intermediate(
+                    part_value,
+                    f"TO_RENAME_INTERMEDIATES/{job_id}/{i}.pkl",
+                    storage_bucket,
+                ),
+        ).compute(*run_map_args, **run_map_kwargs)
+
+        return list(_chunker((f"TO_RENAME_INTERMEDIATES/{job_id}/{i}.pkl" for i in range(len(self._part_names_and_values))), branch_factor))
+
+    # TODO probably rename to shuffle?
     def groupby(
         self,
         column_names: Sequence[str],
@@ -313,6 +377,22 @@ class DataFrame(Generic[_UDataFrame]):
         num_bits = num_partitions.bit_length() - 1
         return DataFrameGroupBy(self, column_names, num_bits)
 
+    # def reduce_raw(self
+    #     func2: Callable[[List[_UDataFrame]], _VDataFrame]
+    # ):
+
+    def reduce(
+            self,
+            func1: Callable[[_TDataFrame], _UDataFrame],
+            func2: Callable[[_UDataFrame], _VDataFrame],
+            branch_factor: int = 8,
+            final_num_partitions: int = 1,
+    ) -> DataFrame[_VDataFrame]:
+        return DataFrame(
+            lambda i, part_name, part_value: func2(asyncio.run(_read_intermediates(part_value[0], part_value[1]))),
+            None, None, DataFrameReduce(self.map_parts(func1), branch_factor, final_num_partitions)
+        )
+
 
 import s3fs
 
@@ -322,14 +402,21 @@ async def _from_s3_helper(
     object_name: str,
     column_names: Optional[Sequence[str]],
 ) -> Any:
+    print(f"Staring _from_s3 {datetime.datetime.now()}")
+    t0 = time.time()
+
     # ALT2
     # see https://www.programcreek.com/python/example/115410/s3fs.S3FileSystem
     fs = s3fs.S3FileSystem(client_kwargs={"region_name": "us-east-2"})
-    return pd.read_parquet(
+    result = pd.read_parquet(
         path=f"s3://meadowrun-us-east-2-034389035875/{object_name}",
         filesystem=fs,
         columns=column_names,
     )
+
+    print(f"_from_s3 finished in {time.time() - t0}")
+
+    return result
 
     # ALT 1
     # client = boto3.client("s3", region_name="us-east-2")
@@ -402,6 +489,10 @@ async def _to_groups_helper(
     name: str,
     storage_bucket: StorageBucketSpec,
 ) -> Dict[int, Tuple[int, int]]:
+    t0 = time.time()
+    t_serialize = 0
+    t_io = 0
+
     # effectively https://github.com/python/cpython/blob/main/Objects/tupleobject.c#L319
     # vectorized TODO NOT ACTUALLY! ^^^
 
@@ -424,41 +515,143 @@ async def _to_groups_helper(
     results = {}
     with io.BytesIO() as buffer:
         for key, group_df in df.groupby(hash_column):
-            group_df.to_parquet(buffer)
+            t0_serialize = time.time()
+            group_df.reset_index(drop=True).to_feather(buffer)
+            t_serialize += time.time() - t0_serialize
             next_i = buffer.tell()
             results[key] = i, next_i
             i = next_i
 
         client = boto3.client("s3", region_name="us-east-2")
+        t0_io = time.time()
         client.put_object(
             Bucket="meadowrun-us-east-2-034389035875", Key=name, Body=buffer.getvalue()
         )
+        t_io += time.time() - t0_io
         # async with await storage_bucket.get_storage_bucket_in_cluster() as sb:
         #     await sb.write_bytes(buffer.getvalue(), name)
+
+    print(f"to_groups completed in {time.time() - t0}. Serialization time {t_serialize}, io time {t_io}. Time is {datetime.datetime.now()}")
 
     return results
 
 
 async def _read_groups(
-    groups: Tuple[str, Tuple[int, int]], storage_bucket: StorageBucketSpec
+    groups: List[Tuple[str, Tuple[int, int]]], storage_bucket: StorageBucketSpec,
 ) -> _TDataFrame:
-    dfs = []
+    import datetime
+    print(f"Starting _read_groups {datetime.datetime.now()}")
 
-    client = boto3.client("s3", region_name="us-east-2")
-    # async with await storage_bucket.get_storage_bucket_in_cluster() as sb:
-    for object_key, byte_range in groups:
-        body = client.get_object(
-            Bucket="meadowrun-us-east-2-034389035875",
-            Key=object_key,
-            Range=f"bytes={byte_range[0]}-{byte_range[1] - 1}",
-        )["Body"]
-        bs = body.read()
-        print(f"{object_key} {byte_range} {len(bs)}")
-        with io.BytesIO(bs) as buffer:
-            dfs.append(pd.read_parquet(buffer))
-        # with io.BytesIO(await sb.get_byte_range(object_key, byte_range)) as buffer:
-        #     dfs.append(pd.read_parquet(buffer))
-    return pd.concat(dfs)
+    t0 = time.time()
+    t_io = 0
+    t_deserialize = 0
+    t_reducer_func = 0
+
+    dfs = []
+    storage_bucket = S3BucketSpec("us-east-2",
+                                  "meadowrun-us-east-2-034389035875")  # TODO FIX, use actual parameter
+    async with await storage_bucket.get_storage_bucket_in_cluster() as sb:
+        i = 0
+        for bs in asyncio.as_completed(
+            [sb.get_byte_range(object_key, (byte_range[0], byte_range[1] - 1)) for object_key, byte_range in groups]
+        ):
+            t0_deserialize = time.time()
+            with io.BytesIO(await bs) as buffer:
+                dfs.append(pd.read_feather(buffer))
+
+            i += 1
+            if i % 25 == 0:
+                print(f"Processed {i} {datetime.datetime.now()}")
+            t_deserialize += time.time() - t0_deserialize
+            # with io.BytesIO(await sb.get_byte_range(object_key, byte_range)) as buffer:
+            #     dfs.append(pd.read_parquet(buffer))
+
+    t1 = time.time()
+    if len(dfs) == 1:
+        result = dfs[0]
+    else:
+        result = pd.concat(dfs)
+    t1 = time.time() - t1
+
+    print(f"_read_groups completed in {time.time() - t0}. io was {t_io}, deserialize was {t_deserialize} pd.concat was {t1} reducer_func time was {t_reducer_func}")
+
+    return result
+
+
+def _to_intermediate(
+    df: _PandasDF,
+    name: str,
+    storage_bucket: StorageBucketSpec,
+) -> None:
+    t0 = time.time()
+    t_serialize = 0
+    t_io = 0
+
+    with io.BytesIO() as buffer:
+        t0_serialize = time.time()
+        df.reset_index(drop=True).to_feather(buffer)
+        t_serialize += time.time() - t0_serialize
+
+        client = boto3.client("s3", region_name="us-east-2")
+        t0_io = time.time()
+        client.put_object(
+            Bucket="meadowrun-us-east-2-034389035875", Key=name, Body=buffer.getvalue()
+        )
+        t_io += time.time() - t0_io
+        # async with await storage_bucket.get_storage_bucket_in_cluster() as sb:
+        #     await sb.write_bytes(buffer.getvalue(), name)
+
+    print(f"_to_intermediate completed in {time.time() - t0}. Serialization time {t_serialize}, io time {t_io}. Time is {datetime.datetime.now()}")
+
+
+# TODO deduplicate with above code
+async def _read_intermediates(
+    groups: List[str], storage_bucket: StorageBucketSpec,
+) -> _TDataFrame:
+    import datetime
+    print(f"Starting _read_groups {datetime.datetime.now()}")
+
+    t0 = time.time()
+    t_io = 0
+    t_deserialize = 0
+    t_reducer_func = 0
+
+    dfs = []
+    storage_bucket = S3BucketSpec("us-east-2",
+                                  "meadowrun-us-east-2-034389035875")  # TODO FIX, use actual parameter
+    async with await storage_bucket.get_storage_bucket_in_cluster() as sb:
+        i = 0
+        for bs in asyncio.as_completed(
+            [sb.get_bytes(object_key) for object_key in groups]
+        ):
+            t0_deserialize = time.time()
+            with io.BytesIO(await bs) as buffer:
+                dfs.append(pd.read_feather(buffer))
+
+            i += 1
+            if i % 25 == 0:
+                print(f"Processed {i} {datetime.datetime.now()}")
+            t_deserialize += time.time() - t0_deserialize
+            # with io.BytesIO(await sb.get_byte_range(object_key, byte_range)) as buffer:
+            #     dfs.append(pd.read_parquet(buffer))
+
+    t1 = time.time()
+    if len(dfs) == 1:
+        result = dfs[0]
+    else:
+        result = pd.concat(dfs)
+    t1 = time.time() - t1
+
+    print(f"_read_groups completed in {time.time() - t0}. io was {t_io}, deserialize was {t_deserialize} pd.concat was {t1} reducer_func time was {t_reducer_func}")
+
+    return result
+
+
+class DataFrameReduce(Generic[_TDataFrame]):
+    def __init__(self, base_df: DataFrame, branch_factor: int, final_num_partitions: int):
+        self._base_df = base_df
+        self._branch_factor = branch_factor
+        self._final_num_partitions = final_num_partitions
 
 
 class DataFrameGroupBy(Generic[_TDataFrame]):
@@ -472,7 +665,7 @@ class DataFrameGroupBy(Generic[_TDataFrame]):
     def map_parts(
         self,
         pre_reduce_func: Optional[Callable[[_TDataFrame], _UDataFrame]],
-        reducer_func: Callable[[_UDataFrame], _VDataFrame],
+        reduce_finish_func: Callable[[_UDataFrame], _VDataFrame],
     ) -> DataFrame[_VDataFrame]:
         # TODO what if they don't concat correctly?
 
@@ -486,18 +679,25 @@ class DataFrameGroupBy(Generic[_TDataFrame]):
             )
 
         return DataFrame(
-            lambda i, part_name, part_value: reducer_func(asyncio.run(_read_groups(part_value[0], part_value[1]))),
+            lambda i, part_name, part_value: reduce_finish_func(asyncio.run(_read_groups(part_value[0], part_value[1]))),
             None,
             previous_groupby,
+            None
         )
         # return self.apply_raw(lambda dfs: pd.concat(dfs)).map_parts(func)
 
     def apply(
-        self, func: Callable[[pd.core.groupby.generic.DataFrameGroupBy], _UDataFrame]
+        self,
+        func1: Callable[[pd.core.groupby.generic.DataFrameGroupBy], _UDataFrame],
+            # TYPE IS NOT RIGHT HERE
+        func2: Optional[Callable[[pd.core.groupby.generic.DataFrameGroupBy], _UDataFrame]],
     ) -> DataFrame[_UDataFrame]:
+        if func2 is None:
+            func2 = func1
+
         return self.map_parts(
-            lambda df: func(df.groupby(self._column_names, as_index=False)),
-            lambda df: func(df.groupby(self._column_names)),
+            lambda df: func1(df.groupby(self._column_names, as_index=False)),
+            lambda df: func2(df.groupby(self._column_names)),
         )
 
 
@@ -781,10 +981,10 @@ async def fake_checkins():
     ).to_s3("fake_checkins", storage_bucket, **the_args)
 
 
-async def test():
+async def test(n):
     storage_bucket = S3BucketSpec("us-east-2", "meadowrun-us-east-2-034389035875")
     host = meadowrun.AllocEC2Instance()
-    resources = meadowrun.Resources(1, 6)
+    resources = meadowrun.Resources(1.5, 4)
 
     deployment = await meadowrun.Deployment.mirror_local(
         interpreter=meadowrun.LocalPipInterpreter(sys.executable),
@@ -794,7 +994,7 @@ async def test():
     the_args = dict(
         host=host,
         deployment=deployment,
-        num_concurrent_tasks=8,
+        num_concurrent_tasks=64,
         resources_per_task=resources,
     )
 
@@ -809,17 +1009,20 @@ async def test():
 
     # print(await mddf.map_parts(foo).parts_iloc[:64].compute(**the_args))
 
-    mddf = mddf.parts_iloc[-64:]
+    mddf = mddf.parts_iloc[-n:]
 
     t0 = time.time()
 
     def foo(df):
+        t1 = time.time()
         stuff = df.groupby("user_id", as_index=False)["location_id"].nunique()
-        user_ids = stuff.loc[stuff["location_id"] > 10, "user_id"]
-        return df[df["user_id"].isin(user_ids)]
+        user_ids = stuff.loc[stuff["location_id"] > 45, "user_id"]
+        result = df[df["user_id"].isin(user_ids)]
+        print(f"foo finished in {time.time() - t1} {datetime.datetime.now()}")
+        return result
 
     result = await mddf \
-        .groupby(["user_id"], 64) \
+        .groupby(["user_id"], n) \
         .map_parts(lambda df: df, foo).compute(storage_bucket=storage_bucket, **the_args)
 
     print(time.time() - t0)
@@ -829,6 +1032,55 @@ async def test():
     pd.to_pickle(result_df, "temp.pkl")
 
 
+async def temp_test():
+    storage_bucket = S3BucketSpec("us-east-2", "meadowrun-us-east-2-034389035875")
+    host = meadowrun.AllocEC2Instance()
+    resources = meadowrun.Resources(1.5, 8)
+
+    deployment = await meadowrun.Deployment.mirror_local(
+        interpreter=meadowrun.LocalPipInterpreter(sys.executable),
+        environment_variables={"PYTHONHASHSEED": "0"}
+    )
+
+    the_args = dict(
+        host=host,
+        deployment=deployment,
+        num_concurrent_tasks=64,
+        resources_per_task=resources,
+    )
+
+    mddf = await DataFrame.from_s3(
+        "fake_checkins",
+        storage_bucket)
+
+    mddf = mddf.parts_iloc[-512:]
+
+    t1 = time.time()
+    # print(await mddf.map_parts(foo).compute(**the_args))
+
+    # print(await mddf.groupby(["location_id"], 1)\
+    #     # .map_parts2(
+    #     #     lambda df: df.groupby(["location_id"], as_index=False)[["dt"]].count(),
+    #     #     lambda df1, df2: pd.concat([df1, df2]).groupby(["location_id"], as_index=False).sum(),
+    #     #     lambda df: df
+    #     # )
+    # .apply(
+    #     lambda gr: gr[["dt"]].count(),
+    #     lambda gr: gr.sum()
+    # )
+
+    print(await mddf.reduce(lambda df: df.groupby(["location_id"], as_index=False)[["dt"]].count(),
+                            lambda df: df.groupby(["location_id"], as_index=False).sum(),
+                            )
+          .compute(storage_bucket=storage_bucket, **the_args))
+
+    print(time.time() - t1)
+
 
 if __name__ == "__main__":
-    asyncio.run(test())
+    asyncio.run(test(256))
+    print("That was 256")
+    asyncio.run(test(128))
+    print("That was 128")
+    asyncio.run(test(64))
+    print("That was 64")

@@ -63,6 +63,60 @@ class AllocVM(Host, abc.ABC):
     [AllocAzureVM][meadowrun.AllocAzureVM]
     """
 
+    async def run_map_(
+        self,
+        function: Callable[[_T], _U],
+        args: Sequence[_T],
+        resources_required_per_task: Optional[ResourcesInternal],
+        job_fields: Dict[str, Any],
+        num_concurrent_tasks: int,
+        pickle_protocol: int,
+        wait_for_result: WaitOption,
+        max_num_task_attempts: int,
+        retry_with_more_memory: bool,
+    ) -> AsyncIterable[TaskResult[_U]]:
+        if resources_required_per_task is None:
+            raise ValueError(
+                "Resources.logical_cpu and memory_gb must be specified for "
+                "AllocEC2Instance and AllocAzureVM"
+            )
+        if job_fields["ports"] and self.get_cloud_provider() == "AzureVM":
+            raise NotImplementedError(
+                "Opening ports on Azure is not implemented, please comment on "
+                "https://github.com/meadowdata/meadowrun/issues/126"
+            )
+
+        base_job_id = str(uuid.uuid4())
+        async with self._create_grid_job_worker_launcher(
+            base_job_id, function, pickle_protocol, job_fields, wait_for_result
+        ) as worker_launcher, self._create_grid_job_cloud_interface(
+            base_job_id
+        ) as cloud_interface:
+            driver = GridJobDriver(
+                cloud_interface,
+                worker_launcher,
+                num_concurrent_tasks,
+                resources_required_per_task,
+            )
+            run_worker_loops = asyncio.create_task(driver.run_worker_functions())
+            num_tasks_done = 0
+            async for result in driver.add_tasks_and_get_results(
+                args, max_num_task_attempts, retry_with_more_memory
+            ):
+                yield result
+                num_tasks_done += 1
+
+            await run_worker_loops
+
+        # this is for extra safety--the only case where we don't get all of our results
+        # back should be if run_worker_loops throws an exception because there were
+        # worker failures
+        if num_tasks_done < len(args):
+            raise ValueError(
+                "Gave up retrieving task results, most likely due to worker failures. "
+                f"Received {num_tasks_done}/{len(args)} task results."
+            )
+
     async def run_map_as_completed(
         self,
         function: Callable[[_T], _U],
@@ -539,8 +593,9 @@ class GridJobQueueWorkerLauncher(GridJobWorkerLauncher):
                 await self.launch_jobs(
                     public_address, instance_name, job_object_id, worker_job_ids
                 )
+                import datetime
                 print(
-                    "Launched workers: "
+                    f"Launched workers at {datetime.datetime.now()}: "
                     + ", ".join(
                         f"{public_address}:{get_log_path(worker_job_id)}"
                         for worker_job_id in worker_job_ids
